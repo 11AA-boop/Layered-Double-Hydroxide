@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import sys
 import warnings
@@ -30,37 +30,48 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import KFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import PowerTransformer, StandardScaler
 from scipy.stats import gaussian_kde
 try:
     import shap  
 except Exception:  
     shap = None
 
-DATA_PATH = "22221...newdata.xlsx"
-OUTPUT_DIR = "outputs"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BASE_DIR, "22221...newdata.xlsx")
+OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 JOINT_PLOT_FILENAME = "joint_distribution_catboost.png"
 LEGACY_JOINT_PLOT_FILENAME = "parity_joint_catboost.png"
 PDP_PLOT_FILENAME = "pdp_selected_6features.png"
 LEGACY_PDP_PLOT_FILENAME = "pdp.png"
-RANDOM_STATE = 42
-GROUP1_BASES = [
+RANDOM_SEEDS = [32, 42, 52, 62, 72]
+REPRESENTATIVE_SEED = 42
+# All 12 material-category columns.  These columns are one-hot/binary features
+# and must never fall through to the numeric pipeline.
+MATERIAL_BASES = [
+    "Mg-Al",
+    "Mg-Fe",
+    "Cu-AL",
+    "Zn-Al",
     "Ca-Al",
     "Ca-Fe",
     "Ca-Mg",
     "Zn-Fe",
-    "Mg-AL",
     "Ni-Fe",
     "Fe-Al",
+    "Mg-La",
     "Mn-Fe",
 ]
+
+# The material columns are mutually exclusive (one-hot encoded).
+GROUP1_BASES = MATERIAL_BASES
 
 GROUP2_BASES = [
     "Zr-",
     "La-",
     "CO3-",
     "Cl-",
-    "NO3",
+    "NO3-",
 ]
 
 SPECIAL_NUM_BASES = ["ta", "Tads", "Co", "Ca"]
@@ -103,10 +114,12 @@ def _find_col_case_insensitive(columns, names):
     return None
 
 def _get_cols_by_bases(columns, bases):
-    bases_set = set(bases)
+    # Material headers are case-sensitive: Mg-Al and Mg-AL are distinct
+    # fields and must never be merged during feature detection.
+    bases_set = {str(base).strip() for base in bases}
     matched = []
     for col in columns:
-        if _base_name(col) in bases_set:
+        if _base_name(_normalize_col(col)) in bases_set:
             matched.append(col)
     return matched
 
@@ -202,6 +215,21 @@ def _prepare_features(df):
     group1_cols = _get_cols_by_bases(df.columns, GROUP1_BASES)
     group2_cols = _get_cols_by_bases(df.columns, GROUP2_BASES)
 
+    # Fail loudly instead of silently treating a missing material column as a
+    # continuous feature.  This keeps the model schema explicitly binary for
+    # every declared material category.
+    matched_material_bases = {_base_name(col) for col in group1_cols}
+    missing_materials = [
+        base
+        for base in MATERIAL_BASES
+        if base not in matched_material_bases
+    ]
+    if missing_materials:
+        raise SystemExit(
+            "Required material columns not found: "
+            + ", ".join(missing_materials)
+        )
+
     temp_col = _find_col_case_insensitive(df.columns, ["Tcal", "Tcal"])
     if temp_col and temp_col not in df.columns:
         temp_col = None
@@ -237,18 +265,19 @@ def _prepare_features(df):
             f"[Fix] Group2 adjusted rows: {fix2['fixed']} / {fix2['total']}."
         )
 
-    if not group1_cols and not group2_cols and binary_cols:
-        _coerce_binary(df, binary_cols)
+    # Enforce integer 0/1 representation for every recognized binary field.
+    _coerce_binary(df, binary_cols)
     _coerce_numeric(df, [c for c in feature_cols if c not in binary_cols])
 
     _constraint_report(df, group1_cols, group2_cols)
 
     return df, target_col, feature_cols, binary_cols, group1_cols, group2_cols, temp_col
 
-def _build_pipeline(numeric_cols, binary_cols):
+def _build_pipeline(numeric_cols, binary_cols, random_state=REPRESENTATIVE_SEED):
     numeric_pipe = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
+            ("yeo_johnson", PowerTransformer(method="yeo-johnson", standardize=False)),
             ("scaler", StandardScaler()),
         ]
     )
@@ -271,7 +300,7 @@ def _build_pipeline(numeric_cols, binary_cols):
         learning_rate=0.05,
         depth=6,
         loss_function="RMSE",
-        random_seed=RANDOM_STATE,
+        random_seed=random_state,
         verbose=False,
     )
     return Pipeline(
@@ -293,9 +322,15 @@ def _evaluate(y_true, y_pred):
 def _plot_residuals(y_true, y_pred, output_dir):
     residuals = y_true - y_pred
 
+    x_min = float(np.min(y_pred))
+    x_max = float(np.max(y_pred))
+    x_pad = max((x_max - x_min) * 0.02, 1.0)
+    band_x = np.array([x_min - x_pad, x_max + x_pad])
+
     plt.figure(figsize=(7, 5))
-    plt.scatter(y_pred, residuals, alpha=0.6)
+    plt.scatter(y_pred, residuals, alpha=0.6, zorder=2)
     plt.axhline(0, color="red", linestyle="--", linewidth=1)
+    plt.xlim(band_x[0], band_x[-1])
     plt.xlabel("Predicted")
     plt.ylabel("Residual (True - Pred)")
     plt.title("Residuals vs Predicted (CatBoost)")
@@ -537,13 +572,14 @@ def _compute_pdp_curves(pipeline, X_pdp, pdp_features):
 
 def _draw_pdp_panel(ax, curve, gray_color, blue_color, letter=None, show_legend=False):
     from matplotlib.lines import Line2D
+    from matplotlib.ticker import MaxNLocator
 
     spec = curve["spec"]
     ax.plot(
         curve["x_raw"],
         curve["y_raw"],
         color=gray_color,
-        linewidth=1.8,
+        linewidth=2.1,
         alpha=0.95,
         solid_capstyle="round",
         zorder=1,
@@ -552,13 +588,19 @@ def _draw_pdp_panel(ax, curve, gray_color, blue_color, letter=None, show_legend=
         curve["x_smooth"],
         curve["y_smooth"],
         color=blue_color,
-        linewidth=2.0,
+        linewidth=2.4,
         alpha=0.95,
         solid_capstyle="round",
         zorder=2,
     )
-    ax.set_xlabel(spec["label"])
-    ax.set_ylabel("PDP")
+    ax.set_xlabel(spec["label"], fontsize=16, fontweight="bold", labelpad=7)
+    ax.set_ylabel("PDP", fontsize=16, fontweight="bold", labelpad=7)
+
+    if spec["label"].casefold() == "ph":
+        ax.set_xlim(left=3.0)
+        x_upper = float(np.nanmax(curve["x_smooth"]))
+        ax.set_xticks(np.arange(3.0, np.ceil(x_upper) + 1.0, 2.0))
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
     if letter is not None:
         ax.text(
@@ -566,7 +608,8 @@ def _draw_pdp_panel(ax, curve, gray_color, blue_color, letter=None, show_legend=
             1.02,
             letter,
             transform=ax.transAxes,
-            fontsize=24,
+            fontsize=26,
+            fontweight="bold",
             fontfamily="serif",
             va="bottom",
         )
@@ -574,17 +617,20 @@ def _draw_pdp_panel(ax, curve, gray_color, blue_color, letter=None, show_legend=
     for spine in ax.spines.values():
         spine.set_color("#9f9f9f")
         spine.set_linewidth(1.0)
-    ax.tick_params(axis="both", colors="#444444", labelsize=12)
+    ax.tick_params(axis="both", colors="#222222", labelsize=14, width=1.2)
+    for tick in ax.get_xticklabels() + ax.get_yticklabels():
+        tick.set_fontweight("bold")
     ax.grid(False)
 
     if show_legend:
         ax.legend(
             handles=[
-                Line2D([0], [0], color=gray_color, lw=1.8, label="ML prediction"),
-                Line2D([0], [0], color=blue_color, lw=2.0, label="Fitted curve"),
+                Line2D([0], [0], color=gray_color, lw=2.1, label="ML prediction"),
+                Line2D([0], [0], color=blue_color, lw=2.4, label="Fitted curve"),
             ],
             loc="upper right",
             frameon=False,
+            prop={"size": 12, "weight": "bold"},
         )
 
 
@@ -636,7 +682,7 @@ def _plot_pdp(pipeline, X_train, pdp_features, output_dir):
             X_pdp[spec["column"]], errors="coerce"
         ).astype(float)
 
-    fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.5))
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 8.6))
     axes = axes.ravel()
     gray_color = "#c9c9c9"
     blue_color = "#46a3f7"
@@ -656,13 +702,14 @@ def _plot_pdp(pipeline, X_train, pdp_features, output_dir):
 
     fig.legend(
         handles=[
-            Line2D([0], [0], color=gray_color, lw=1.8, label="ML prediction"),
-            Line2D([0], [0], color=blue_color, lw=2.0, label="Fitted curve"),
+            Line2D([0], [0], color=gray_color, lw=2.1, label="ML prediction"),
+            Line2D([0], [0], color=blue_color, lw=2.4, label="Fitted curve"),
         ],
         loc="upper center",
         ncol=2,
         frameon=False,
         bbox_to_anchor=(0.52, 1.02),
+        prop={"size": 14, "weight": "bold"},
     )
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.savefig(
@@ -737,24 +784,66 @@ def main():
 
     numeric_cols = [c for c in feature_cols if c not in binary_cols]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_STATE
+    seed_records = []
+    representative_result = None
+    for seed in RANDOM_SEEDS:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=seed
+        )
+        pipeline = _build_pipeline(numeric_cols, binary_cols, random_state=seed)
+        pipeline.fit(X_train, y_train)
+
+        y_pred = pipeline.predict(X_test)
+        y_pred_train = pipeline.predict(X_train)
+        r2_train = r2_score(y_train, y_pred_train)
+        r2, rmse, mae, mape = _evaluate(y_test, y_pred)
+        seed_records.append(
+            {
+                "seed": seed,
+                "train_r2": r2_train,
+                "test_r2": r2,
+                "test_rmse": rmse,
+                "test_mae": mae,
+                "test_mape": mape,
+            }
+        )
+        if seed == REPRESENTATIVE_SEED:
+            representative_result = (
+                pipeline,
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                y_pred_train,
+                y_pred,
+                r2_train,
+                r2,
+            )
+
+    seed_results = pd.DataFrame(seed_records)
+    seed_results.to_csv(
+        os.path.join(OUTPUT_DIR, "metrics_catboost_multi_seed.csv"),
+        index=False,
+        encoding="utf-8-sig",
     )
+    print("== Test Metrics Across Random Seeds ==")
+    print(seed_results.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
+    print("\n== Multi-seed Summary (mean +/- std) ==")
+    print(seed_results.drop(columns="seed").agg(["mean", "std"]).round(6))
 
-    pipeline = _build_pipeline(numeric_cols, binary_cols)
-    pipeline.fit(X_train, y_train)
+    (
+        pipeline,
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        y_pred_train,
+        y_pred,
+        r2_train,
+        r2,
+    ) = representative_result
 
-    y_pred = pipeline.predict(X_test)
-    y_pred_train = pipeline.predict(X_train)
-    r2_train = r2_score(y_train, y_pred_train)
-    r2, rmse, mae, mape = _evaluate(y_test, y_pred)
-    print("== Test Metrics ==")
-    print(f"R2:   {r2:.6f}")
-    print(f"RMSE: {rmse:.6f}")
-    print(f"MAE:  {mae:.6f}")
-    print(f"MAPE: {mape:.6f}%")
-
-    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    kf = KFold(n_splits=5, shuffle=True, random_state=REPRESENTATIVE_SEED)
     cv_r2 = cross_val_score(pipeline, X, y, cv=kf, scoring="r2")
     cv_rmse = -cross_val_score(
         pipeline, X, y, cv=kf, scoring="neg_root_mean_squared_error"
@@ -793,6 +882,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 
 
 

@@ -19,13 +19,14 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import KFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import PowerTransformer, StandardScaler
 
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "22221...newdata.xlsx")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
-RANDOM_STATE = 42
+RANDOM_SEEDS = [32, 42, 52, 62, 72]
+REPRESENTATIVE_SEED = 42
 TEST_SIZE = 0.2
 PDP_FEATURE_SPECS = [
     {"aliases": ["ts"], "label": "ts", "file_stem": "ts"},
@@ -59,11 +60,16 @@ def _load_helper():
 
 helper = _load_helper()
 
-def build_pipeline(numeric_cols: List[str], binary_cols: List[str]) -> Pipeline:
+def build_pipeline(
+    numeric_cols: List[str],
+    binary_cols: List[str],
+    random_state: int = REPRESENTATIVE_SEED,
+) -> Pipeline:
     
     numeric_pipe = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
+            ("yeo_johnson", PowerTransformer(method="yeo-johnson", standardize=False)),
             ("scaler", StandardScaler()),
         ]
     )
@@ -89,7 +95,7 @@ def build_pipeline(numeric_cols: List[str], binary_cols: List[str]) -> Pipeline:
         colsample_bytree=0.8,
         reg_lambda=1.0,
         objective="reg:squarederror",
-        random_state=RANDOM_STATE,
+        random_state=random_state,
         n_jobs=8,
     )
 
@@ -113,12 +119,20 @@ def plot_residuals(y_true: np.ndarray, y_pred: np.ndarray, output_dir: str) -> N
     """Residual scatter plot and distribution plot."""
     residuals = y_true - y_pred
 
+    x_min = float(np.min(y_pred))
+    x_max = float(np.max(y_pred))
+    x_pad = max((x_max - x_min) * 0.02, 1.0)
+    band_x = np.array([x_min - x_pad, x_max + x_pad])
+
     plt.figure(figsize=(7, 5))
-    plt.scatter(y_pred, residuals, alpha=0.6)
+    plt.scatter(y_pred, residuals, alpha=0.6, zorder=2)
     plt.axhline(0, color="red", linestyle="--", linewidth=1)
+    plt.xlim(band_x[0], band_x[-1])
+    plt.ylim(-44, 44)
+    plt.yticks([-40, -20, 0, 20, 40])
     plt.xlabel("Predicted")
     plt.ylabel("Residual (True - Pred)")
-    plt.title("Residuals vs Predicted (XGB)")
+    plt.title("Residuals vs Predicted (XGBoost)")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "residuals_scatter_xgb.png"), dpi=150)
     plt.close()
@@ -423,7 +437,7 @@ def plot_shap(model: XGBRegressor, preprocess: ColumnTransformer, X_sample: pd.D
 
 def stability_cv(pipeline: Pipeline, X: pd.DataFrame, y: pd.Series, k: int = 5) -> Tuple[float, float, float, float]:
     """Return mean and variance of R² and RMSE from cross-validation."""
-    kf = KFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
+    kf = KFold(n_splits=k, shuffle=True, random_state=REPRESENTATIVE_SEED)
     cv_r2 = cross_val_score(pipeline, X, y, cv=kf, scoring="r2")
     cv_rmse = -cross_val_score(pipeline, X, y, cv=kf, scoring="neg_root_mean_squared_error")
     return float(cv_r2.mean()), float(cv_r2.std()), float(cv_rmse.mean()), float(cv_rmse.std())
@@ -452,24 +466,70 @@ def main() -> None:
     y = df[target_col]
     numeric_cols = [c for c in feature_cols if c not in binary_cols]
 
-   # Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+    seed_records = []
+    representative_result = None
+    for seed in RANDOM_SEEDS:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=TEST_SIZE, random_state=seed
+        )
+        pipeline = build_pipeline(numeric_cols, binary_cols, random_state=seed)
+        pipeline.fit(X_train, y_train)
+
+        y_pred = pipeline.predict(X_test)
+        y_pred_train = pipeline.predict(X_train)
+        r2_train = r2_score(y_train, y_pred_train)
+        r2, rmse, mae, mape = evaluate(y_test, y_pred)
+        seed_records.append(
+            {
+                "seed": seed,
+                "train_r2": r2_train,
+                "test_r2": r2,
+                "test_rmse": rmse,
+                "test_mae": mae,
+                "test_mape": mape,
+            }
+        )
+        if seed == REPRESENTATIVE_SEED:
+            representative_result = (
+                pipeline,
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                y_pred_train,
+                y_pred,
+                r2_train,
+                r2,
+                rmse,
+                mae,
+                mape,
+            )
+
+    seed_results = pd.DataFrame(seed_records)
+    seed_results.to_csv(
+        os.path.join(OUTPUT_DIR, "metrics_xgb_multi_seed.csv"),
+        index=False,
+        encoding="utf-8-sig",
     )
+    print("== Test Metrics Across Random Seeds (XGB) ==")
+    print(seed_results.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
+    print("\n== Multi-seed Summary (mean +/- std) ==")
+    print(seed_results.drop(columns="seed").agg(["mean", "std"]).round(6))
 
-    pipeline = build_pipeline(numeric_cols, binary_cols)
-    pipeline.fit(X_train, y_train)
-
-    # Test set metrics
-    y_pred = pipeline.predict(X_test)
-    y_pred_train = pipeline.predict(X_train)
-    r2_train = r2_score(y_train, y_pred_train)
-    r2, rmse, mae, mape = evaluate(y_test, y_pred)
-    print("== Test Metrics (XGB) ==")
-    print(f"R2:   {r2:.6f}")
-    print(f"RMSE: {rmse:.6f}")
-    print(f"MAE:  {mae:.6f}")
-    print(f"MAPE: {mape:.6f}%")
+    (
+        pipeline,
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        y_pred_train,
+        y_pred,
+        r2_train,
+        r2,
+        rmse,
+        mae,
+        mape,
+    ) = representative_result
 
     plot_residuals(y_test, y_pred, OUTPUT_DIR)
     plot_parity_with_marginals(
@@ -498,7 +558,7 @@ def main() -> None:
 
     # SHAP
     sample_n = min(500, len(X_train))
-    X_sample = X_train.sample(n=sample_n, random_state=RANDOM_STATE)
+    X_sample = X_train.sample(n=sample_n, random_state=REPRESENTATIVE_SEED)
     plot_shap(model, preprocess, X_sample, feature_names, OUTPUT_DIR)
 
     metrics_path = os.path.join(OUTPUT_DIR, "metrics_xgb.txt")
@@ -508,6 +568,11 @@ def main() -> None:
         f.write(f"RMSE: {rmse:.6f}\n")
         f.write(f"MAE:  {mae:.6f}\n")
         f.write(f"MAPE: {mape:.6f}%\n\n")
+        f.write("== Multi-seed Test Metrics ==\n")
+        f.write(seed_results.to_string(index=False) + "\n\n")
+        f.write("== Multi-seed Summary (mean +/- std) ==\n")
+        f.write(seed_results.drop(columns="seed").agg(["mean", "std"]).to_string())
+        f.write("\n\n")
         f.write("== Stability (5-fold CV) ==\n")
         f.write(f"R2 mean: {cv_r2_mean:.6f}, std: {cv_r2_std:.6f}\n")
         f.write(f"RMSE mean: {cv_rmse_mean:.6f}, std: {cv_rmse_std:.6f}\n")

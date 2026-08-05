@@ -1,4 +1,4 @@
-﻿import os, importlib.machinery, importlib.util, warnings
+import os, importlib.machinery, importlib.util, warnings
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -11,14 +11,15 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import PowerTransformer, StandardScaler
 
 warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "22221...newdata.xlsx")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
-RANDOM_STATE = 42
+RANDOM_SEEDS = [32, 42, 52, 62, 72]
+REPRESENTATIVE_SEED = 42
 TEST_SIZE = 0.2
 PDP_FEATURE_SPECS = [
     {"aliases": ["ts"], "label": "ts", "file_stem": "ts"},
@@ -50,9 +51,10 @@ def _load_helper():
 
 helper = _load_helper()
 
-def build_pipeline(numeric_cols, binary_cols):
+def build_pipeline(numeric_cols, binary_cols, random_state=REPRESENTATIVE_SEED):
     numeric_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
+        ("yeo_johnson", PowerTransformer(method="yeo-johnson", standardize=False)),
         ("scaler", StandardScaler()),
     ])
     binary_pipe = Pipeline([
@@ -69,7 +71,7 @@ def build_pipeline(numeric_cols, binary_cols):
         num_leaves=63,
         subsample=0.9,
         colsample_bytree=0.8,
-        random_state=RANDOM_STATE,
+        random_state=random_state,
         objective="regression",
         n_jobs=8,
         verbosity=-1,
@@ -88,13 +90,24 @@ def evaluate(y_true, y_pred):
     return r2, rmse, mae, mape
 
 def plot_residuals(y_true, y_pred, output_dir):
+    from matplotlib.ticker import MultipleLocator
+
     residuals = y_true - y_pred
+
+    x_min = float(np.min(y_pred))
+    x_max = float(np.max(y_pred))
+    x_pad = max((x_max - x_min) * 0.02, 1.0)
+    band_x = np.array([x_min - x_pad, x_max + x_pad])
+
     plt.figure(figsize=(7,5))
-    plt.scatter(y_pred, residuals, alpha=0.6)
+    plt.scatter(y_pred, residuals, alpha=0.6, zorder=2)
     plt.axhline(0, color="red", linestyle="--", linewidth=1)
+    plt.xlim(band_x[0], band_x[-1])
     plt.xlabel("Predicted")
     plt.ylabel("Residual (True - Pred)")
-    plt.title("Residuals vs Predicted (LGBM)")
+    plt.title("Residuals vs Predicted (LightGBM)")
+    plt.ylim(-44.0, 44.0)
+    plt.gca().yaxis.set_major_locator(MultipleLocator(20))
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "residuals_scatter_lgbm.png"), dpi=150)
     plt.close()
@@ -352,15 +365,19 @@ def plot_shap(model, preprocess, X_sample, feature_names, output_dir):
         X_trans = np.asarray(X_trans, dtype=float)
         import shap
         warnings.filterwarnings("ignore", category=UserWarning)
-        explainer = shap.Explainer(model.predict, X_trans)
-        shap_values = explainer(X_trans)
+        # LightGBM is a tree model, so use TreeExplainer instead of the much
+        # slower model-agnostic PermutationExplainer.
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_trans, check_additivity=False)
+        if isinstance(shap_values, list):
+            shap_values = shap_values[0]
         plt.figure()
-        shap.summary_plot(shap_values.values, X_trans, feature_names=feature_names, show=False)
+        shap.summary_plot(shap_values, X_trans, feature_names=feature_names, show=False)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "shap_summary_lgbm.png"), dpi=150)
         plt.close()
         plt.figure()
-        shap.summary_plot(shap_values.values, X_trans, feature_names=feature_names, plot_type="bar", show=False)
+        shap.summary_plot(shap_values, X_trans, feature_names=feature_names, plot_type="bar", show=False)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "shap_bar_lgbm.png"), dpi=150)
         plt.close()
@@ -368,7 +385,7 @@ def plot_shap(model, preprocess, X_sample, feature_names, output_dir):
         print(f"[SHAP] skip due to error: {exc}")
 
 def stability_cv(pipeline, X, y, k=5):
-    kf = KFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
+    kf = KFold(n_splits=k, shuffle=True, random_state=REPRESENTATIVE_SEED)
     cv_r2 = cross_val_score(pipeline, X, y, cv=kf, scoring="r2")
     cv_rmse = -cross_val_score(pipeline, X, y, cv=kf, scoring="neg_root_mean_squared_error")
     return float(cv_r2.mean()), float(cv_r2.std()), float(cv_rmse.mean()), float(cv_rmse.std())
@@ -396,20 +413,50 @@ def main():
     y = df[target_col]
     numeric_cols = [c for c in feature_cols if c not in binary_cols]
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    seed_records = []
+    representative_result = None
+    for seed in RANDOM_SEEDS:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=TEST_SIZE, random_state=seed
+        )
+        pipeline = build_pipeline(numeric_cols, binary_cols, random_state=seed)
+        pipeline.fit(X_train, y_train)
 
-    pipeline = build_pipeline(numeric_cols, binary_cols)
-    pipeline.fit(X_train, y_train)
+        y_pred = pipeline.predict(X_test)
+        y_pred_train = pipeline.predict(X_train)
+        r2_train = r2_score(y_train, y_pred_train)
+        r2, rmse, mae, mape = evaluate(y_test, y_pred)
+        seed_records.append(
+            {
+                "seed": seed,
+                "train_r2": r2_train,
+                "test_r2": r2,
+                "test_rmse": rmse,
+                "test_mae": mae,
+                "test_mape": mape,
+            }
+        )
+        if seed == REPRESENTATIVE_SEED:
+            representative_result = (
+                pipeline, X_train, X_test, y_train, y_test, y_pred_train,
+                y_pred, r2_train, r2, rmse, mae, mape,
+            )
 
-    y_pred = pipeline.predict(X_test)
-    y_pred_train = pipeline.predict(X_train)
-    r2_train = r2_score(y_train, y_pred_train)
-    r2, rmse, mae, mape = evaluate(y_test, y_pred)
-    print("== Test Metrics (LGBM) ==")
-    print(f"R2:   {r2:.6f}")
-    print(f"RMSE: {rmse:.6f}")
-    print(f"MAE:  {mae:.6f}")
-    print(f"MAPE: {mape:.6f}%")
+    seed_results = pd.DataFrame(seed_records)
+    seed_results.to_csv(
+        os.path.join(OUTPUT_DIR, "metrics_lgbm_multi_seed.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    print("== Test Metrics Across Random Seeds (LGBM) ==")
+    print(seed_results.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
+    print("\n== Multi-seed Summary (mean +/- std) ==")
+    print(seed_results.drop(columns="seed").agg(["mean", "std"]).round(6))
+
+    (
+        pipeline, X_train, X_test, y_train, y_test, y_pred_train,
+        y_pred, r2_train, r2, rmse, mae, mape,
+    ) = representative_result
 
     plot_residuals(y_test, y_pred, OUTPUT_DIR)
     plot_parity_with_marginals(
@@ -429,7 +476,7 @@ def main():
     plot_pdp(pipeline, X_train, pdp_features, OUTPUT_DIR)
 
     sample_n = min(500, len(X_train))
-    X_sample = X_train.sample(n=sample_n, random_state=RANDOM_STATE)
+    X_sample = X_train.sample(n=sample_n, random_state=REPRESENTATIVE_SEED)
     plot_shap(model, preprocess, X_sample, feature_names, OUTPUT_DIR)
 
     metrics_path = os.path.join(OUTPUT_DIR, "metrics_lgbm.txt")
@@ -439,6 +486,11 @@ def main():
         f.write(f"RMSE: {rmse:.6f}\n")
         f.write(f"MAE:  {mae:.6f}\n")
         f.write(f"MAPE: {mape:.6f}%\n\n")
+        f.write("== Multi-seed Test Metrics ==\n")
+        f.write(seed_results.to_string(index=False) + "\n\n")
+        f.write("== Multi-seed Summary (mean +/- std) ==\n")
+        f.write(seed_results.drop(columns="seed").agg(["mean", "std"]).to_string())
+        f.write("\n\n")
         f.write("== Stability (5-fold CV) ==\n")
         f.write(f"R2 mean: {cv_r2_mean:.6f}, std: {cv_r2_std:.6f}\n")
         f.write(f"RMSE mean: {cv_rmse_mean:.6f}, std: {cv_rmse_std:.6f}\n")

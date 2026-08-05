@@ -10,14 +10,15 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import PowerTransformer, StandardScaler
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import BaggingRegressor
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DATA_PATH = os.path.join(BASE_DIR, "22221...newdata.xlsx")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
-RANDOM_STATE = 42
+RANDOM_SEEDS = [32, 42, 52, 62, 72]
+REPRESENTATIVE_SEED = 42
 TEST_SIZE = 0.2
 PDP_FEATURE_SPECS = [
     {"aliases": ["ts"], "label": "ts", "file_stem": "ts"},
@@ -48,9 +49,10 @@ def _load_helper():
 
 helper = _load_helper()
 
-def build_pipeline(numeric_cols, binary_cols):
+def build_pipeline(numeric_cols, binary_cols, random_state=REPRESENTATIVE_SEED):
     numeric_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
+        ("yeo_johnson", PowerTransformer(method="yeo-johnson", standardize=False)),
         ("scaler", StandardScaler()),
     ])
     binary_pipe = Pipeline([
@@ -60,14 +62,14 @@ def build_pipeline(numeric_cols, binary_cols):
         ("num", numeric_pipe, numeric_cols),
         ("bin", binary_pipe, binary_cols),
     ], remainder="drop")
-    base_tree = DecisionTreeRegressor(random_state=RANDOM_STATE, min_samples_leaf=2)
+    base_tree = DecisionTreeRegressor(random_state=random_state, min_samples_leaf=2)
     model = BaggingRegressor(
         estimator=base_tree,
         n_estimators=200,
         max_samples=0.9,
         max_features=1.0,
         bootstrap=True,
-        random_state=RANDOM_STATE,
+        random_state=random_state,
         n_jobs=1,
     )
     return Pipeline([
@@ -84,16 +86,40 @@ def evaluate(y_true, y_pred):
     return r2, rmse, mae, mape
 
 def plot_residuals(y_true, y_pred, output_dir):
-    residuals = y_true - y_pred
-    plt.figure(figsize=(7,5))
-    plt.scatter(y_pred, residuals, alpha=0.6)
-    plt.axhline(0, color="red", linestyle="--", linewidth=1)
-    plt.xlabel("Predicted")
-    plt.ylabel("Residual (True - Pred)")
-    plt.title("Residuals vs Predicted (BRT)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "residuals_scatter_bagging.png"), dpi=150)
-    plt.close()
+    y_pred = np.asarray(y_pred, dtype=float)
+    residuals = np.asarray(y_true, dtype=float) - y_pred
+
+    x_min = float(np.min(y_pred))
+    x_max = float(np.max(y_pred))
+    x_pad = max((x_max - x_min) * 0.02, 1.0)
+    band_x = np.array([x_min - x_pad, x_max + x_pad])
+
+    fig, ax = plt.subplots(figsize=(10.5, 7.5))
+    ax.scatter(
+        y_pred,
+        residuals,
+        s=42,
+        color="#2f8fc5",
+        edgecolors="#2479ad",
+        linewidths=0.7,
+        alpha=0.68,
+        zorder=2,
+    )
+    ax.axhline(0, color="red", linestyle="--", linewidth=1.4, zorder=3)
+    ax.set_xlim(band_x[0], band_x[-1])
+    ax.set_ylim(-44, 44)
+    ax.set_yticks([-40, -20, 0, 20, 40])
+    ax.set_xlabel("Predicted", fontsize=18)
+    ax.set_ylabel("Residual (True - Pred)", fontsize=18)
+    ax.set_title("Residuals vs Predicted (BTR)", fontsize=20)
+    ax.tick_params(axis="both", labelsize=14)
+    fig.tight_layout()
+    fig.savefig(
+        os.path.join(output_dir, "residuals_scatter_bagging.png"),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
 
     plt.figure(figsize=(7,5))
     plt.hist(residuals, bins=30, alpha=0.7)
@@ -368,7 +394,7 @@ def plot_shap(model, preprocess, X_sample, feature_names, output_dir):
         print(f"[SHAP] skip due to error: {exc}")
 
 def stability_cv(pipeline, X, y, k=5):
-    kf = KFold(n_splits=k, shuffle=True, random_state=RANDOM_STATE)
+    kf = KFold(n_splits=k, shuffle=True, random_state=REPRESENTATIVE_SEED)
     cv_r2 = cross_val_score(pipeline, X, y, cv=kf, scoring="r2")
     cv_rmse = -cross_val_score(pipeline, X, y, cv=kf, scoring="neg_root_mean_squared_error")
     return float(cv_r2.mean()), float(cv_r2.std()), float(cv_rmse.mean()), float(cv_rmse.std())
@@ -396,20 +422,50 @@ def main():
     y = df[target_col]
     numeric_cols = [c for c in feature_cols if c not in binary_cols]
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    seed_records = []
+    representative_result = None
+    for seed in RANDOM_SEEDS:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=TEST_SIZE, random_state=seed
+        )
+        pipeline = build_pipeline(numeric_cols, binary_cols, random_state=seed)
+        pipeline.fit(X_train, y_train)
 
-    pipeline = build_pipeline(numeric_cols, binary_cols)
-    pipeline.fit(X_train, y_train)
+        y_pred = pipeline.predict(X_test)
+        y_pred_train = pipeline.predict(X_train)
+        r2_train = r2_score(y_train, y_pred_train)
+        r2, rmse, mae, mape = evaluate(y_test, y_pred)
+        seed_records.append(
+            {
+                "seed": seed,
+                "train_r2": r2_train,
+                "test_r2": r2,
+                "test_rmse": rmse,
+                "test_mae": mae,
+                "test_mape": mape,
+            }
+        )
+        if seed == REPRESENTATIVE_SEED:
+            representative_result = (
+                pipeline, X_train, X_test, y_train, y_test, y_pred_train,
+                y_pred, r2_train, r2, rmse, mae, mape,
+            )
 
-    y_pred = pipeline.predict(X_test)
-    y_pred_train = pipeline.predict(X_train)
-    r2_train = r2_score(y_train, y_pred_train)
-    r2, rmse, mae, mape = evaluate(y_test, y_pred)
-    print("== Test Metrics (Bagging) ==")
-    print(f"R2:   {r2:.6f}")
-    print(f"RMSE: {rmse:.6f}")
-    print(f"MAE:  {mae:.6f}")
-    print(f"MAPE: {mape:.6f}%")
+    seed_results = pd.DataFrame(seed_records)
+    seed_results.to_csv(
+        os.path.join(OUTPUT_DIR, "metrics_bagging_multi_seed.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    print("== Test Metrics Across Random Seeds (Bagging) ==")
+    print(seed_results.to_string(index=False, float_format=lambda value: f"{value:.6f}"))
+    print("\n== Multi-seed Summary (mean +/- std) ==")
+    print(seed_results.drop(columns="seed").agg(["mean", "std"]).round(6))
+
+    (
+        pipeline, X_train, X_test, y_train, y_test, y_pred_train,
+        y_pred, r2_train, r2, rmse, mae, mape,
+    ) = representative_result
 
     plot_residuals(y_test, y_pred, OUTPUT_DIR)
     plot_parity_with_marginals(
@@ -432,7 +488,7 @@ def main():
     plot_pdp(pipeline, X_train, pdp_features, OUTPUT_DIR)
 
     sample_n = min(150, len(X_train))
-    X_sample = X_train.sample(n=sample_n, random_state=RANDOM_STATE)
+    X_sample = X_train.sample(n=sample_n, random_state=REPRESENTATIVE_SEED)
     plot_shap(model, preprocess, X_sample, feature_names, OUTPUT_DIR)
 
     metrics_path = os.path.join(OUTPUT_DIR, "metrics_bagging.txt")
@@ -442,6 +498,11 @@ def main():
         f.write(f"RMSE: {rmse:.6f}\n")
         f.write(f"MAE:  {mae:.6f}\n")
         f.write(f"MAPE: {mape:.6f}%\n\n")
+        f.write("== Multi-seed Test Metrics ==\n")
+        f.write(seed_results.to_string(index=False) + "\n\n")
+        f.write("== Multi-seed Summary (mean +/- std) ==\n")
+        f.write(seed_results.drop(columns="seed").agg(["mean", "std"]).to_string())
+        f.write("\n\n")
         f.write("== Stability (5-fold CV) ==\n")
         f.write(f"R2 mean: {cv_r2_mean:.6f}, std: {cv_r2_std:.6f}\n")
         f.write(f"RMSE mean: {cv_rmse_mean:.6f}, std: {cv_rmse_std:.6f}\n")
